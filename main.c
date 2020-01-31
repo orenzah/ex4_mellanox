@@ -30,7 +30,7 @@
  * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  */
-#define EX3
+#define EX4
 
 #include <assert.h>
 #include <stdio.h>
