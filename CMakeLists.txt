@@ -4,5 +4,5 @@ project(ex4 C)
 set(CMAKE_C_STANDARD 11)
 
 link_libraries(ibverbs)
-add_executable(client main.c main.c hash.h hash.c)
+add_executable(client client.c hash.h hash.c client.c)
 add_executable(server main.c hash.h hash.c)
