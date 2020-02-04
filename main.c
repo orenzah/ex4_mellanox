@@ -932,6 +932,28 @@ void add_work_request(uint64_t id, uint8_t user, struct ibv_mr* mr, void* ctx, u
     temp->user = user;
     temp->ctx = ctx;
 }
+uint64_t get_wrid_by_hash(uint64_t hashvalue)
+{
+    wrnode_t *temp;
+    if(!wr_head)
+    {
+        return -1;
+    }
+    else
+    {
+        temp = wr_head;
+        while (temp)
+        {
+            if (temp->hash != hashvalue)
+            {
+                temp = temp->next;
+            } else {
+                return temp->wr_id;
+            }
+        }
+        return -1;
+    }
+}
 wrnode_t* pop_wrnode(uint64_t id)
 {
     wrnode_t *temp, *prev;
@@ -1057,6 +1079,22 @@ int rdma_done_handler(struct pingpong_context *ctx, struct packet *packet, uint8
 {
     // received a RDMA_DONE packet, that is the other side done to RDMA READ
     // we need to dereg the memory region for this operation
+    // find the work request based on the hash value
+    uint64_t *hashvalue = (uint64_t *)packet->rdma_done.hashvalue;
+    uint64_t wrid = get_wrid_by_hash(*hashvalue);
+    if (wrid == -1)
+    {
+        fprintf(stderr, "No such hash value has been found\n");
+        return 1;
+    }
+    wrnode_t* mynode = pop_wrnode(wrid); //this is our node holding the parameters for the memory region
+    if (ibv_dereg_mr(mynode->p_mr)) // de-register the memory region
+    {
+        fprintf(stderr, "Failed to release ibv_dered_mr\n");
+        perror("ibv_dereg_mr");
+        return 1;
+    }
+    free(mynode);
     return 0;
 }
 int find_request_handler(struct pingpong_context *ctx, struct packet *packet, uint8_t user)
@@ -1167,8 +1205,8 @@ int handle_completions_wr(wrnode_t* wrnode)
                 return find_request_handler(wrnode->ctx, packet, user);
                 break; //TODO replace with return of function
             case RENDEZVOUS_DONE:
+                return rdma_done_handler(wrnode->ctx, packet, user);
                 break; //TODO replace with return of function
-
             default:
                 fprintf(stderr, "No Such packet type is supported %d\n", packet->type);
                 return 1;
@@ -1561,6 +1599,7 @@ int manager(struct pingpong_context **ctxs, int numClients, int num) {
             //TODO take care the completeion
             wrnode_t *node_wr = pop_wrnode(wc[i].wr_id);
             handle_completions_wr(node_wr);
+            //the callee handle_completions_wr is responsible to free the pointers inside in node_wr
             free(node_wr); // free after free all the relevant pointers inside that struct
         } else {
             fprintf(stderr, "Completion for unknown wr_id %d\n",
