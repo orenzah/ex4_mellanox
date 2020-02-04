@@ -1109,7 +1109,7 @@ int find_request_handler(struct pingpong_context *ctx, struct packet *packet, ui
 
 
     //set pakcet type LOCATION and the selected value
-    packet->location.selected_server = hashvalue % packet->find.num_of_servers;
+    *(packet->location.selected_server) = hashvalue % packet->find.num_of_servers;
     packet->type = LOCATION;
     response_size = sizeof (struct packet) + 12;
     pp_post_send_rdmaread(ctx, IBV_WR_SEND, response_size, NULL, NULL, 0, id_cnt);
@@ -1127,7 +1127,7 @@ int get_request_handler(struct pingpong_context *ctx, struct packet *packet, uin
     // KV exist?
     if (p_value) {
 
-        value_size; = strlen(p_value) + 1;
+        value_size = strlen(p_value) + 1;
         // is greater then EAGER_PROTOCOL_LIMIT
         if (value_size > (EAGER_PROTOCOL_LIMIT - sizeof(struct packet)))
         {
@@ -1167,14 +1167,14 @@ int get_request_handler(struct pingpong_context *ctx, struct packet *packet, uin
     }
     else
     {
-        / set packet type EAGER_GET_RESPONSE
+        // set packet type EAGER_GET_RESPONSE
         get_r_packet->type = EAGER_GET_RESPONSE;
         get_r_packet->eager_get_response.value[0] = 0;
         get_r_packet->eager_get_response.value_length = 1;
         response_size = sizeof(struct packet) + get_r_packet->eager_get_response.value_length;
     }
     pp_post_send_rdmaread(ctx, IBV_WR_SEND,response_size,NULL, NULL, 0, id_cnt);
-    add_work_request(id_cnt++, user, r_mr, ctx, hashvalue, SELF_LOCAL_SEND);
+    add_work_request(id_cnt++, user, NULL, ctx, hashvalue, SELF_LOCAL_SEND);
     return 0;
 
 }
@@ -1210,7 +1210,7 @@ int handle_completions_wr(wrnode_t* wrnode)
                 return find_request_handler(wrnode->ctx, packet, user);
                 break; //TODO replace with return of function
             case RENDEZVOUS_DONE:
-                return rdma_done_handler(wrnode->ctx, packet, user);
+                return rendezvous_done_handler(wrnode->ctx, packet, user);
                 break; //TODO replace with return of function
             default:
                 fprintf(stderr, "No Such packet type is supported %d\n", packet->type);
