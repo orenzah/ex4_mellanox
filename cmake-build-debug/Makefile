@@ -136,6 +136,36 @@ server/fast:
 	$(MAKE) -f CMakeFiles/server.dir/build.make CMakeFiles/server.dir/build
 .PHONY : server/fast
 
+hash.o: hash.c.o
+
+.PHONY : hash.o
+
+# target to build an object file
+hash.c.o:
+	$(MAKE) -f CMakeFiles/client.dir/build.make CMakeFiles/client.dir/hash.c.o
+	$(MAKE) -f CMakeFiles/server.dir/build.make CMakeFiles/server.dir/hash.c.o
+.PHONY : hash.c.o
+
+hash.i: hash.c.i
+
+.PHONY : hash.i
+
+# target to preprocess a source file
+hash.c.i:
+	$(MAKE) -f CMakeFiles/client.dir/build.make CMakeFiles/client.dir/hash.c.i
+	$(MAKE) -f CMakeFiles/server.dir/build.make CMakeFiles/server.dir/hash.c.i
+.PHONY : hash.c.i
+
+hash.s: hash.c.s
+
+.PHONY : hash.s
+
+# target to generate assembly for a file
+hash.c.s:
+	$(MAKE) -f CMakeFiles/client.dir/build.make CMakeFiles/client.dir/hash.c.s
+	$(MAKE) -f CMakeFiles/server.dir/build.make CMakeFiles/server.dir/hash.c.s
+.PHONY : hash.c.s
+
 main.o: main.c.o
 
 .PHONY : main.o
@@ -176,6 +206,9 @@ help:
 	@echo "... client"
 	@echo "... rebuild_cache"
 	@echo "... server"
+	@echo "... hash.o"
+	@echo "... hash.i"
+	@echo "... hash.s"
 	@echo "... main.o"
 	@echo "... main.i"
 	@echo "... main.s"

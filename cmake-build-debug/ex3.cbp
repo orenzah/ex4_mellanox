@@ -118,6 +118,10 @@
 				</MakeCommands>
 			</Target>
 		</Build>
+		<Unit filename="/media/orenzah/Disk2/Studies/Semester2020A/Accelarated/ex4/hash.h">
+			<Option target="client"/>
+			<Option target="server"/>
+		</Unit>
 		<Unit filename="/media/orenzah/Disk2/Studies/Semester2020A/Accelarated/ex4/main.c">
 			<Option target="client"/>
 			<Option target="server"/>
