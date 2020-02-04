@@ -58,11 +58,22 @@
 
 int g_argc;
 char **g_argv;
+uint64_t  id_cnt = 1000;
+
+
 
 #define EAGER_PROTOCOL_LIMIT (1 << 12) /* 4KB limit */
 #define MAX_TEST_SIZE (0 * EAGER_PROTOCOL_LIMIT)
 #define TEST_LOCATION "~/www/"
-
+enum operation_type
+{
+    SELF_LOCAL_SEND,
+    SELF_LOCAL_RECV,
+    SELF_RDMA_READ,
+    SELF_RDMA_WRITE,
+    REMOTE_RDMA_READ,
+    REMOTE_RDMA_WRITE,
+};
 enum packet_type {
     EAGER_GET_REQUEST,
     EAGER_GET_RESPONSE,
@@ -75,6 +86,10 @@ enum packet_type {
     RENDEZVOUS_SET_RESPONSE,
     RENDEZVOUS_DONE,
 
+#ifdef EX4
+    FIND,
+    LOCATION,
+#endif
 };
 
 
@@ -83,6 +98,22 @@ enum packet_type {
 
 
 /* Added by Oren & Efi */
+struct wrnode_t
+{
+    struct mrnode_t* next;
+    struct ibv_mr* p_mr;
+    uint64_t    wr_id;
+    uint64_t    hash;
+    uint8_t    user;
+    uint8_t     operation;
+    int    counter;
+    void*  ctx; // struct pingpong_context*
+} typedef wrnode_t;
+
+wrnode_t*   wr_head;
+static struct ibv_cq *global_cq = NULL;
+static struct ibv_context	*global_context = NULL;
+
 //FILE* my_file = fopen("ex3_test.txt", 'r');
 FILE* my_file;
 struct kv_file
@@ -92,6 +123,7 @@ struct kv_file
     char* value;
 
 };
+
 struct kv_file parse_file(FILE** myfile)
 {
     FILE* file = *myfile;
@@ -227,6 +259,9 @@ struct packet {
 
         /* EAGER PROTOCOL PACKETS */
         struct {
+#ifdef EX4
+            unsigned value_length; /* value is binary, so needs to have length! */
+#endif
             char key_and_value[0]; /* null terminator between key and value */
         } eager_set_request;
 
@@ -253,8 +288,23 @@ struct packet {
 
         /* TODO - maybe there are more packet types? */
 
+#ifdef EX4
+        struct {
+            unsigned num_of_servers;
+            char key[0];
+        } find;
+
+        struct {
+            uint8_t selected_server[0]; //enough 1 byte
+        } location;
+
+        struct {
+            uint8_t hashvalue[0]; //8 bytes
+        } rdma_done;
+#endif
     };
 };
+
 
 struct kv_server_address {
     char *servername; /* In the last item of an array this is NULL */
@@ -264,6 +314,8 @@ struct kv_server_address {
 enum {
     PINGPONG_RECV_WRID = 1,
     PINGPONG_SEND_WRID = 2,
+    PINGPONG_SEND_RDMA_READ_WRID = 3,
+    PINGPONG_SEND_RDMA_WRITE_WRID = 4,
 };
 
 static int page_size;
@@ -580,6 +632,7 @@ static struct pingpong_dest *pp_server_exch_dest(struct pingpong_context *ctx,
 }
 
 #include <sys/param.h>
+#include "hash.h"
 
 static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
                                             int rx_depth, int port,
@@ -602,14 +655,18 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
     }
 
     memset(ctx->buf, 0x7b + is_server, size);
+    if (global_context == NULL) {
+        ctx->context = ibv_open_device(ib_dev);
+        global_context = ctx->context;
+    }
+    ctx->context = global_context;
 
-    ctx->context = ibv_open_device(ib_dev);
     if (!ctx->context) {
         fprintf(stderr, "Couldn't get context for %s\n",
                 ibv_get_device_name(ib_dev));
         return NULL;
     }
-
+    printf("ctx->context %p\n", ctx->context);
     if (use_event) {
         ctx->channel = ibv_create_comp_channel(ctx->context);
         if (!ctx->channel) {
@@ -630,14 +687,18 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
         fprintf(stderr, "Couldn't register MR\n");
         return NULL;
     }
-
-    ctx->cq = ibv_create_cq(ctx->context, rx_depth + 1, NULL,
-                            ctx->channel, 0);
+    if (global_cq == NULL) {
+        ctx->cq = ibv_create_cq(ctx->context, rx_depth + 1, NULL,
+                                ctx->channel, 0);
+        global_cq = ctx->cq;
+    }
+    else
+        ctx->cq = global_cq;
     if (!ctx->cq) {
         fprintf(stderr, "Couldn't create CQ\n");
         return NULL;
     }
-
+    printf("cq %p\n", ctx->cq);
     {
         struct ibv_qp_init_attr attr = {
                 .send_cq = ctx->cq,
@@ -654,6 +715,7 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
         ctx->qp = ibv_create_qp(ctx->pd, &attr);
         if (!ctx->qp)  {
             fprintf(stderr, "Couldn't create QP\n");
+            perror("");
             return NULL;
         }
     }
@@ -720,6 +782,27 @@ int pp_close_ctx(struct pingpong_context *ctx)
 
     return 0;
 }
+static int pp_post_recv_user(struct pingpong_context *ctx, int n, uint64_t wrid)
+{
+    struct ibv_sge list = {
+            .addr	= (uintptr_t) ctx->buf,
+            .length = ctx->size,
+            .lkey	= ctx->mr->lkey
+    };
+    struct ibv_recv_wr wr = {
+            .wr_id	    = wrid,
+            .sg_list    = &list,
+            .num_sge    = 1,
+            .next       = NULL
+    };
+    struct ibv_recv_wr *bad_wr;
+    int i;
+
+    for (i = 0; i < n; ++i)
+        if (ibv_post_recv(ctx->qp, &wr, &bad_wr))
+            break;
+    return i;
+}
 
 static int pp_post_recv(struct pingpong_context *ctx, int n)
 {
@@ -742,7 +825,30 @@ static int pp_post_recv(struct pingpong_context *ctx, int n)
             break;
     return i;
 }
+static int pp_post_send_rdmaread(struct pingpong_context *ctx, enum ibv_wr_opcode opcode, unsigned size, const char *local_ptr, void *remote_ptr, uint32_t remote_key, uint64_t id)
+{
+    struct ibv_sge list = {
+            .addr	= (uintptr_t) (local_ptr ? local_ptr : ctx->buf),
+            .length = size,
+            .lkey	= ctx->mr->lkey
+    };
+    struct ibv_send_wr wr = {
+            .wr_id	    = id,
+            .sg_list    = &list,
+            .num_sge    = 1,
+            .opcode     = opcode,
+            .send_flags = IBV_SEND_SIGNALED,
+            .next       = NULL
+    };
 
+    struct ibv_send_wr *bad_wr;
+
+    if (remote_ptr) {
+        wr.wr.rdma.remote_addr = (uintptr_t) remote_ptr;
+        wr.wr.rdma.rkey = remote_key;
+    }
+    return ibv_post_send(ctx->qp, &wr, &bad_wr);
+}
 static int pp_post_send(struct pingpong_context *ctx, enum ibv_wr_opcode opcode, unsigned size, const char *local_ptr, void *remote_ptr, uint32_t remote_key)
 {
     struct ibv_sge list = {
@@ -786,7 +892,298 @@ static void usage(const char *argv0)
     printf("  -e, --events           sleep on CQ events (default poll)\n");
     printf("  -g, --gid-idx=<gid index> local port gid index\n");
 }
+void add_work_request(uint64_t id, uint8_t user, struct ibv_mr* mr, void* ctx, uint64_t hash, uint8_t operation)
+{
+    wrnode_t *temp, *prev;
+    if (wr_head == NULL)
+    {
+        //add the first node
+        temp = (wrnode_t*)malloc(sizeof(wrnode_t));
+        temp->next = NULL;
+        temp->wr_id = id;
+        temp->counter = 0;
+        temp->p_mr = mr;
+        temp->user = user;
+        temp->ctx = ctx;
+        temp->hash = hash;
+        temp->operation = operation;
+        wr_head = temp;
+        return;
+    }
 
+    prev = temp = wr_head;
+    while(temp)
+    {
+        prev = temp;
+        temp = temp->next;
+    }
+
+    temp = (wrnode_t*)malloc(sizeof(wrnode_t));
+
+    if (!temp)
+    {
+        exit(1);
+    }
+    prev->next = temp;
+    temp->next = NULL;
+    temp->wr_id = id;
+    temp->counter = 0;
+    temp->p_mr = mr;
+    temp->user = user;
+    temp->ctx = ctx;
+}
+wrnode_t* pop_wrnode(uint64_t id)
+{
+    wrnode_t *temp, *prev;
+    temp = wr_head;
+    while (temp != NULL && temp->wr_id != id)
+    {
+        prev = temp;
+        temp = temp->next;
+    }
+    if (temp == wr_head)
+    {
+        //this is the head
+        wr_head = wr_head->next;
+    } else {
+        prev->next = temp->next;
+    }
+    return temp; //callee is not responsible for free this node, the caller is responsible
+}
+int wr_exist(uint64_t id)
+{
+    wrnode_t *temp;
+    if(!wr_head)
+    {
+        return 0;
+    }
+    else
+    {
+        temp = wr_head;
+        while (temp)
+        {
+            if (temp->wr_id != id)
+            {
+                temp = temp->next;
+            } else {
+                return 1;
+            }
+        }
+        return 0;
+    }
+}
+int rendezvous_set_req_handler(struct pingpong_context *ctx, struct packet *packet, uint8_t user)
+{
+    uint32_t* remote_key;
+    uint64_t* remote_addr;
+    uint32_t* remote_size;
+    uint8_t*  remote_keyval;
+
+    struct ibv_mr *r_mr;
+
+    // parse the details of the KV to be set from the packet
+    remote_key  = (packet->rndv_set_request.kv_params + 0);     //the remote key
+    remote_addr = (packet->rndv_set_request.kv_params + 4);     //the remote address
+    remote_size = (packet->rndv_set_request.kv_params + 12);    //the remote value size
+    remote_keyval = (packet->rndv_set_request.kv_params + 16);  //the remote key (array of chars)
+
+    // allocate the space for KV node
+    uint32_t key_size = strlen(remote_keyval) + 1;
+    uint8_t* key_str  = (uint8_t*)malloc(key_size);
+    if (key_str == NULL) {
+        fprintf(stderr, "Failed to allocate memory to key_str\n");
+        return 1;
+    }
+    strcpy(key_str, remote_keyval);
+    uint8_t* value_str = (uint8_t*)malloc(*remote_size);
+    if (value_str == NULL) {
+        fprintf(stderr, "Failed to allocate memory to value_str\n");
+        return 1;
+    }
+    // register the memory region for the KV node LOCAL_WRITE
+    struct ibv_mr *mr;
+    struct ibv_sge sge;
+    struct ibv_send_wr wr, *bad_wr;
+    r_mr = ibv_reg_mr(ctx->pd, value_str,*remote_size, IBV_ACCESS_LOCAL_WRITE);
+    if (r_mr == NULL) {
+        fprintf(stderr, "Failed to register memory region\n");
+        return 1;
+    }
+    struct ibv_mr* temp_mr = ctx->mr; // TODO test if really needed
+    ctx->mr = r_mr;
+
+    // post send using REMOTE READ
+    pp_post_send_rdmaread(ctx,IBV_ACCESS_REMOTE_READ, *remote_size ,value_str, *remote_addr, *remote_key, id_cnt);
+    ctx->mr = temp_mr;
+
+    // register work request
+    add_work_request(id_cnt++, user, r_mr, ctx, hash(key_str), SELF_LOCAL_SEND);
+
+    set_kv_value(key_str, value_str);
+
+    free_kv_value(key_str, kv_head);
+    return 0;
+}
+int eager_set_request_handler(struct pingpong_context *ctx, struct packet *packet, uint8_t user)
+{
+    char* key_str;
+    char* value_str;
+    uint32_t key_len = strlen(packet->eager_set_request.key_and_value) + 1;
+    uint32_t value_len;
+    // allocate KV node
+    key_str = (char*)malloc(key_len);
+    if (key_str == NULL)
+    {
+        fprintf(stderr, "Failed to allocate memory to key_str\n");
+        return 1;
+    }
+    strcpy(key_str, packet->eager_set_request.key_and_value);
+
+    value_len = strlen((packet->eager_set_request.key_and_value) + key_len)  + 1;
+    value_str = (char*)malloc(value_len + 1);
+    if (value_str == NULL)
+    {
+        fprintf(stderr, "Failed to allocate memory to key_str\n");
+        return 1;
+    }
+    strcpy(value_str, packet->eager_set_request.key_and_value + key_len);
+
+    // push the new KV node, and remove the old one
+    set_kv_value(key_str, value_str);
+    free_kv_value(key_str, kv_head);
+    return 0;
+}
+int rdma_done_handler(struct pingpong_context *ctx, struct packet *packet, uint8_t user)
+{
+    // received a RDMA_DONE packet, that is the other side done to RDMA READ
+    // we need to dereg the memory region for this operation
+    return 0;
+}
+int find_request_handler(struct pingpong_context *ctx, struct packet *packet, uint8_t user)
+{
+    char* key_str;
+    char* value_str;
+    unsigned response_size = 0;
+    uint64_t  hashvalue = 0;
+    uint8_t targetedServer = -1;
+    uint32_t key_len = strlen(packet->find.key) + 1;
+    hashvalue = hash(packet->find.key);
+
+
+    //set pakcet type LOCATION and the selected value
+    packet->location.selected_server = hashvalue % packet->find.num_of_servers;
+    packet->type = LOCATION;
+    response_size = sizeof (struct packet) + 12;
+    pp_post_send_rdmaread(ctx, IBV_WR_SEND, response_size, NULL, NULL, 0, id_cnt);
+    add_work_request(id_cnt++,user, NULL, ctx, hashvalue, SELF_LOCAL_SEND);
+    return 0;
+}
+int get_request_handler(struct pingpong_context *ctx, struct packet *packet, uint8_t user)
+{
+    char* p_value = get_kv_value(packet->eager_get_request.value, kv_head);
+
+    struct packet* get_r_packet = (struct packet*)ctx->buf;
+    uint64_t hashvalue = hash(packet->eager_get_request.value);
+    uint32_t value_size;
+    unsigned response_size = 0;
+    // KV exist?
+    if (p_value) {
+
+        value_size; = strlen(p_value) + 1;
+        // is greater then EAGER_PROTOCOL_LIMIT
+        if (value_size > (EAGER_PROTOCOL_LIMIT - sizeof(struct packet)))
+        {
+            // register memory region for RDMA REMOTE READ
+            struct ibv_mr *r_mr;
+            uint32_t* my_key  = get_r_packet->rndv_get_response.params;
+            uint64_t* my_addr = get_r_packet->rndv_get_response.params + 4;
+            uint32_t* size = get_r_packet->rndv_get_response.params + 12;
+            r_mr = ibv_reg_mr(ctx->pd, p_value, value_size, IBV_ACCESS_REMOTE_READ);
+            if (r_mr == NULL)
+            {
+                perror("ibv_reg_mr");
+                fprintf(stderr, "Failed allocate memory region\n");
+                return 1;
+            }
+
+            // set packet type RENDEZVOUS_GET_RESPONSE
+            get_r_packet->type = RENDEZVOUS_GET_RESPONSE;
+
+            *my_key  = (uint32_t )r_mr->rkey;
+            *my_addr = (uint64_t )r_mr->addr;
+            *size    = value_size;
+
+            response_size = sizeof(struct packet) + 4 + 8 + 4; // set the size of the new packet
+            pp_post_send_rdmaread(ctx, IBV_WR_SEND,response_size,NULL, NULL, 0, id_cnt);
+            add_work_request(id_cnt++, user, r_mr, ctx, hashvalue, REMOTE_RDMA_READ);
+            return 0;
+        }
+        else
+        {
+            // set packet type EAGER_GET_RESPONSE
+            get_r_packet->type = EAGER_GET_RESPONSE;
+            strcpy(get_r_packet->eager_get_response.value, p_value);
+            get_r_packet->eager_get_response.value_length = value_size;
+            response_size = sizeof(struct packet) + get_r_packet->eager_get_response.value_length;
+        }
+    }
+    else
+    {
+        / set packet type EAGER_GET_RESPONSE
+        get_r_packet->type = EAGER_GET_RESPONSE;
+        get_r_packet->eager_get_response.value[0] = 0;
+        get_r_packet->eager_get_response.value_length = 1;
+        response_size = sizeof(struct packet) + get_r_packet->eager_get_response.value_length;
+    }
+    pp_post_send_rdmaread(ctx, IBV_WR_SEND,response_size,NULL, NULL, 0, id_cnt);
+    add_work_request(id_cnt++, user, r_mr, ctx, hashvalue, SELF_LOCAL_SEND);
+    return 0;
+
+}
+int handle_completions_wr(wrnode_t* wrnode)
+{
+    struct pingpong_context *ctx = (struct pingpong_context *)wrnode->ctx;
+    struct packet *packet = (struct packet*)ctx->buf;
+    uint8_t user = wrnode->user;
+
+    if (wrnode->operation == PINGPONG_SEND_WRID)
+    {
+
+    }
+    else if (wrnode->operation == PINGPONG_RECV_WRID)
+    {
+        switch (packet->type)
+        {
+            case RENDEZVOUS_SET_REQUEST:
+                return rendezvous_set_req_handler(wrnode->ctx, packet, user);
+                break; //TODO replace with return of function
+            case EAGER_SET_REQUEST:
+                return eager_set_request_handler(wrnode->ctx, packet, user);
+                break; //TODO replace with return of function
+            case EAGER_GET_REQUEST:
+                return get_request_handler(wrnode->ctx, packet, user);
+                break; //TODO replace with return of function
+            case FIND:
+                return find_request_handler(wrnode->ctx, packet, user);
+                break; //TODO replace with return of function
+            case RENDEZVOUS_DONE:
+                break; //TODO replace with return of function
+
+            default:
+                fprintf(stderr, "No Such packet type is supported %d\n", packet->type);
+                return 1;
+        }
+    }
+    else
+    {
+        fprintf(stderr, "No Such Operation %d\n", wrnode->operation);
+        return 1;
+    }
+
+
+
+
+}
 void handle_server_packets_only(struct pingpong_context *ctx, struct packet *packet)
 {
     uint32_t response_size = 0;
@@ -813,8 +1210,8 @@ void handle_server_packets_only(struct pingpong_context *ctx, struct packet *pac
 
                         printf("entered here\n");
                         r_mr = ibv_reg_mr(ctx->pd, p_value, value_size, IBV_ACCESS_REMOTE_READ);
-                        if (r_mr == NULL)                        get_r_packet->type = RENDEZVOUS_GET_RESPONSE;
-
+                        get_r_packet->type = RENDEZVOUS_GET_RESPONSE;
+                        if (r_mr == NULL)
                         {
                             perror("");
                             assert(0);
@@ -874,7 +1271,6 @@ void handle_server_packets_only(struct pingpong_context *ctx, struct packet *pac
             break;
         case RENDEZVOUS_SET_REQUEST: /* TODO (20LOC): handle a long SET() on the server */
             {
-
                 uint32_t* remote_key;
                 uint64_t* remote_addr;
                 uint32_t* remote_size;
@@ -901,7 +1297,9 @@ void handle_server_packets_only(struct pingpong_context *ctx, struct packet *pac
                 r_mr = ibv_reg_mr(ctx->pd, value_str,*remote_size, IBV_ACCESS_LOCAL_WRITE);
                 struct ibv_mr* temp_mr = ctx->mr;
                 ctx->mr = r_mr;
-                pp_post_send(ctx,IBV_ACCESS_REMOTE_READ, *remote_size ,value_str, *remote_addr, *remote_key);
+                pp_post_send_rdmaread(ctx,IBV_ACCESS_REMOTE_READ, *remote_size ,value_str, *remote_addr, *remote_key, 2);
+                //^^^^ This is a problem: there is no poll for cq after this verb.
+                add_work_request(id_cnt, 0/*user*/, r_mr, ctx, 0, IBV_ACCESS_REMOTE_READ);
                 printf("server reached after remote read\n");
 
                 //ibv_post_send(ctx->qp, &wr, &bad_wr);
@@ -945,7 +1343,7 @@ int orig_main(struct kv_server_address *server, unsigned size, int argc, char *a
     struct timeval           start, end;
     char                    *ib_devname = NULL;
     char                    *servername = server->servername;
-    int                      port = server->port;
+    static int              port;
     int                      ib_port = 1;
     enum ibv_mtu		    mtu = IBV_MTU_1024;
     int                      rx_depth = 1;
@@ -955,11 +1353,10 @@ int orig_main(struct kv_server_address *server, unsigned size, int argc, char *a
     int                      rcnt, scnt;
     int                      num_cq_events = 0;
     int                      sl = 0;
-    int			             gidx = -1;
+    static int			             gidx = -1;
     char			         gid[33];
 
     srand48(getpid() * time(NULL));
-
     while (1) {
         int c;
 
@@ -977,7 +1374,7 @@ int orig_main(struct kv_server_address *server, unsigned size, int argc, char *a
                 { 0 }
         };
 
-        c = getopt_long(argc, argv, "p:d:i:s:m:r:n:l:eg:", long_options, NULL);
+        c = getopt_long(argc, argv, "p:q:d:i:s:m:r:n:l:eg:", long_options, NULL);
         if (c == -1)
             break;
 
@@ -989,7 +1386,6 @@ int orig_main(struct kv_server_address *server, unsigned size, int argc, char *a
                     return 1;
                 }
                 break;
-
             case 'd':
                 ib_devname = strdup(optarg);
                 break;
@@ -1039,7 +1435,6 @@ int orig_main(struct kv_server_address *server, unsigned size, int argc, char *a
                 return 1;
         }
     }
-
     if (optind == argc - 1)
         servername = strdup(argv[optind]);
     else if (optind < argc) {
@@ -1116,15 +1511,20 @@ int orig_main(struct kv_server_address *server, unsigned size, int argc, char *a
            my_dest.lid, my_dest.qpn, my_dest.psn, gid);
 
 
-    if (servername)
+
+    if (servername) {
+
         rem_dest = pp_client_exch_dest(servername, port, &my_dest);
-    else
+    }
+    else {
         rem_dest = pp_server_exch_dest(ctx, ib_port, mtu, port, sl, &my_dest, gidx);
+    }
 
     if (!rem_dest)
         return 1;
 
     inet_ntop(AF_INET6, &rem_dest->gid, gid, sizeof gid);
+
     printf("  remote address: LID 0x%04x, QPN 0x%06x, PSN 0x%06x, GID %s\n",
            rem_dest->lid, rem_dest->qpn, rem_dest->psn, gid);
 
@@ -1136,6 +1536,38 @@ int orig_main(struct kv_server_address *server, unsigned size, int argc, char *a
     free(rem_dest);
     *result_ctx = ctx;
     return 0;
+}
+int manager(struct pingpong_context **ctxs, int numClients, int num) {
+    unsigned i, ne;
+    struct pingpong_context *ctx;
+    struct ibv_wc wc[2];
+    do {
+        ne = ibv_poll_cq(global_cq, 2, wc);
+        if (ne < 0) {
+            fprintf(stderr, "poll CQ failed %d\n", ne);
+            return 1;
+        }
+    } while (ne < 1);
+    for (i = 0; i < ne; ++i) {
+        if (wc[i].status != IBV_WC_SUCCESS) {
+
+            fprintf(stderr, "Failed status %s (%d) for wr_id %d\n",
+                    ibv_wc_status_str(wc[i].status),
+                    wc[i].status, (int) wc[i].wr_id);
+            return 1;
+        }
+        if (wr_exist(wc[i].wr_id))
+        {
+            //TODO take care the completeion
+            wrnode_t *node_wr = pop_wrnode(wc[i].wr_id);
+            handle_completions_wr(node_wr);
+            free(node_wr); // free after free all the relevant pointers inside that struct
+        } else {
+            fprintf(stderr, "Completion for unknown wr_id %d\n",
+                    (int) wc[i].wr_id);
+            return 1;
+        }
+    }
 }
 
 int pp_wait_completions(struct pingpong_context *ctx, int iters)
@@ -1232,7 +1664,9 @@ int kv_set(void *kv_handle, const char *key, const char *value) {
     printf("my addr: %x\n", *my_addr);
 
 
+
     pp_post_send(ctx, IBV_WR_SEND, packet_size, NULL, NULL, 0);
+
     struct packet* packet_ack;
 
     do
@@ -1545,11 +1979,23 @@ void recursive_fill_kv(char const* dirname, void *dkv_h) {
 
 void run_server()
 {
-    struct pingpong_context *ctx;
-    struct kv_server_address server = {0};
+    struct pingpong_context *ctx[2];
+    struct kv_server_address server[2] = {0};
+    wr_head = NULL;
 
-    assert(0 == orig_main(&server, EAGER_PROTOCOL_LIMIT, g_argc, g_argv, &ctx));
-    while (0 <= pp_wait_completions(ctx, 1));
+    int i;
+    for (i = 0; i < g_argc; i++)
+    {
+        printf("%s\n", g_argv[i]);
+    }
+    assert(0 == orig_main(&server[0], EAGER_PROTOCOL_LIMIT, g_argc, g_argv, &ctx[0]));
+    for (i = 0; i < g_argc; i++)
+    {
+        printf("%s\n", g_argv[i]);
+    }
+    assert(0 == orig_main(&server[1], EAGER_PROTOCOL_LIMIT, g_argc, g_argv, &ctx[1]));
+    while (0 <= pp_wait_completions(ctx[0], 1));
+
     pp_close_ctx(ctx);
 }
 
@@ -1583,7 +2029,7 @@ int main(int argc, char **argv)
 
     g_argc = argc;
     g_argv = argv;
-    if (argc <= 5) {
+    if (strcmp(argv[0], "./server") == 0) {
         run_server();
     }
 
