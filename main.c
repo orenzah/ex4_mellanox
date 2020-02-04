@@ -1090,10 +1090,11 @@ int rendezvous_done_handler(struct pingpong_context *ctx, struct packet *packet,
     wrnode_t* mynode = pop_wrnode(wrid); //this is our node holding the parameters for the memory region
     if (ibv_dereg_mr(mynode->p_mr)) // de-register the memory region
     {
-        fprintf(stderr, "Failed to release ibv_dered_mr\n");
+        fprintf(stderr, "Couldn't deregister MR\n");
         perror("ibv_dereg_mr");
         return 1;
     }
+    mynode->p_mr = NULL;
     free(mynode);
     return 0;
 }
@@ -1188,10 +1189,20 @@ int handle_completions_wr(wrnode_t* wrnode)
     {
         // this host had end REMOTE_READ from the other host send RENDEZVOUS_DONE packet
         packet->type = RENDEZVOUS_DONE;
+        uint64_t *hashvalue = (packet->rendezvous_done.hashvalue);
+        *hashvalue = wrnode->hash;
+        pp_post_send_rdmaread(ctx,IBV_WR_SEND, sizeof(struct packet) + 8,NULL, NULL, 0, id_cnt);
+        add_work_request(id_cnt++, user, NULL, ctx, 0, SELF_LOCAL_SEND);
+        if (ibv_dereg_mr(wrnode->p_mr))
+        {
+            fprintf(stderr, "Couldn't deregister MR\n");
+            return 1;
+        }
+        wrnode->p_mr = NULL;
     }
     else if (wrnode->operation == SELF_LOCAL_SEND)
     {
-
+        printf("Success Work Request wr_id = %d", wrnode->wr_id);
     }
     else if (wrnode->operation == SELF_LOCAL_RECV)
     {
