@@ -803,6 +803,27 @@ static int pp_post_recv_user(struct pingpong_context *ctx, int n, uint64_t wrid)
             break;
     return i;
 }
+static int pp_post_recv_new(struct pingpong_context *ctx, int n, uint64_t id)
+{
+    struct ibv_sge list = {
+            .addr	= (uintptr_t) ctx->buf,
+            .length = ctx->size,
+            .lkey	= ctx->mr->lkey
+    };
+    struct ibv_recv_wr wr = {
+            .wr_id	    = id,
+            .sg_list    = &list,
+            .num_sge    = 1,
+            .next       = NULL
+    };
+    struct ibv_recv_wr *bad_wr;
+    int i;
+
+    for (i = 0; i < n; ++i)
+        if (ibv_post_recv(ctx->qp, &wr, &bad_wr))
+            break;
+    return i;
+}
 
 static int pp_post_recv(struct pingpong_context *ctx, int n)
 {
@@ -1233,11 +1254,8 @@ int handle_completions_wr(wrnode_t* wrnode)
         fprintf(stderr, "No Such Operation %d\n", wrnode->operation);
         return 1;
     }
-
-
-
-
 }
+
 void handle_server_packets_only(struct pingpong_context *ctx, struct packet *packet)
 {
     uint32_t response_size = 0;
@@ -1526,11 +1544,12 @@ int orig_main(struct kv_server_address *server, unsigned size, int argc, char *a
     if (!ctx)
         return 1;
 
-    routs = pp_post_recv(ctx, ctx->rx_depth);
+    routs = pp_post_recv_new(ctx, ctx->rx_depth, id_cnt);
     if (routs < ctx->rx_depth) {
         fprintf(stderr, "Couldn't post receive (%d)\n", routs);
         return 1;
     }
+    add_work_request(id_cnt++, -1,NULL,ctx, 0, SELF_LOCAL_RECV);
 
     if (use_event)
         if (ibv_req_notify_cq(ctx->cq, 0)) {
@@ -1612,7 +1631,6 @@ int manager(struct pingpong_context **ctxs, int numClients, int num) {
         }
         if (wr_exist(wc[i].wr_id))
         {
-            //TODO take care the completeion
             wrnode_t *node_wr = pop_wrnode(wc[i].wr_id);
             handle_completions_wr(node_wr);
             //the callee handle_completions_wr is responsible to free the pointers inside in node_wr
@@ -2049,7 +2067,7 @@ void run_server()
         printf("%s\n", g_argv[i]);
     }
     assert(0 == orig_main(&server[1], EAGER_PROTOCOL_LIMIT, g_argc, g_argv, &ctx[1]));
-    while (0 <= pp_wait_completions(ctx[0], 1));
+    assert(manager(ctx, 2, 1));
 
     pp_close_ctx(ctx);
 }
