@@ -300,7 +300,7 @@ struct packet {
 
         struct {
             uint8_t hashvalue[0]; //8 bytes
-        } rdma_done;
+        } rendezvous_done;
 #endif
     };
 };
@@ -1075,12 +1075,12 @@ int eager_set_request_handler(struct pingpong_context *ctx, struct packet *packe
     free_kv_value(key_str, kv_head);
     return 0;
 }
-int rdma_done_handler(struct pingpong_context *ctx, struct packet *packet, uint8_t user)
+int rendezvous_done_handler(struct pingpong_context *ctx, struct packet *packet, uint8_t user)
 {
-    // received a RDMA_DONE packet, that is the other side done to RDMA READ
+    // received a RENDEZVOUS_DONE packet, that is the other side done to RDMA READ
     // we need to dereg the memory region for this operation
     // find the work request based on the hash value
-    uint64_t *hashvalue = (uint64_t *)packet->rdma_done.hashvalue;
+    uint64_t *hashvalue = (uint64_t *)packet->rendezvous_done.hashvalue;
     uint64_t wrid = get_wrid_by_hash(*hashvalue);
     if (wrid == -1)
     {
@@ -1184,11 +1184,16 @@ int handle_completions_wr(wrnode_t* wrnode)
     struct packet *packet = (struct packet*)ctx->buf;
     uint8_t user = wrnode->user;
 
-    if (wrnode->operation == PINGPONG_SEND_WRID)
+    if (wrnode->operation == SELF_RDMA_READ)
+    {
+        // this host had end REMOTE_READ from the other host send RENDEZVOUS_DONE packet
+        packet->type = RENDEZVOUS_DONE;
+    }
+    else if (wrnode->operation == SELF_LOCAL_SEND)
     {
 
     }
-    else if (wrnode->operation == PINGPONG_RECV_WRID)
+    else if (wrnode->operation == SELF_LOCAL_RECV)
     {
         switch (packet->type)
         {
