@@ -259,9 +259,7 @@ struct packet {
 
         /* EAGER PROTOCOL PACKETS */
         struct {
-#ifdef EX4
-            unsigned value_length; /* value is binary, so needs to have length! */
-#endif
+
             char key_and_value[0]; /* null terminator between key and value */
         } eager_set_request;
 
@@ -295,7 +293,8 @@ struct packet {
         } find;
 
         struct {
-            uint8_t selected_server[0]; //enough 1 byte
+            uint32_t selected_server;
+            uint8_t data[0]; //enough 1 byte
         } location;
 
         struct {
@@ -785,6 +784,7 @@ int pp_close_ctx(struct pingpong_context *ctx)
 
 static int pp_post_recv_new(struct pingpong_context *ctx, int n, uint64_t id)
 {
+    printf("pp_post_recv_new id=%d\n", id);
     struct ibv_sge list = {
             .addr	= (uintptr_t) ctx->buf,
             .length = ctx->size,
@@ -807,6 +807,7 @@ static int pp_post_recv_new(struct pingpong_context *ctx, int n, uint64_t id)
 
 static int pp_post_recv(struct pingpong_context *ctx, int n)
 {
+
     struct ibv_sge list = {
             .addr	= (uintptr_t) ctx->buf,
             .length = ctx->size,
@@ -828,6 +829,7 @@ static int pp_post_recv(struct pingpong_context *ctx, int n)
 }
 static int pp_post_send_rdmaread(struct pingpong_context *ctx, enum ibv_wr_opcode opcode, unsigned size, const char *local_ptr, void *remote_ptr, uint32_t remote_key, uint64_t id)
 {
+    printf("pp_post_send_rdmaread id=%d\n", id);
     struct ibv_sge list = {
             .addr	= (uintptr_t) (local_ptr ? local_ptr : ctx->buf),
             .length = size,
@@ -1105,19 +1107,24 @@ int find_request_handler(struct pingpong_context *ctx, struct packet *packet, ui
     char* value_str;
     unsigned response_size = 0;
     uint64_t  hashvalue = 0;
-    uint8_t targetedServer = -1;
+    uint32_t targetedServer = -1;
     uint32_t key_len = strlen(packet->find.key) + 1;
     hashvalue = hash(packet->find.key);
 
     printf("FIND packet has been recevied\n");
     //set pakcet type LOCATION and the selected value
-
-    *(packet->location.selected_server) = hashvalue % packet->find.num_of_servers;
-
+    targetedServer = (hashvalue % packet->find.num_of_servers);
+    uint32_t *targetedServerPointer = (uint32_t*)&(packet->location.selected_server);
+    *targetedServerPointer = targetedServer;
+    printf("target %d\n", targetedServer);
+    uint64_t *hashPointer = (uint64_t *)(packet->location.data);
+    *hashPointer = hashvalue;
+    printf("hash = %x\n", *hashPointer);
     packet->type = LOCATION;
 
     response_size = sizeof (struct packet) + 12;
-
+    printf("responsesize %d\n", response_size);
+    printf("realsize %d\n", 4 + 4 + 8);
     pp_post_send_rdmaread(ctx, IBV_WR_SEND, response_size, NULL, NULL, 0, id_cnt);
 
     add_work_request(id_cnt++,user, NULL, ctx, hashvalue, SELF_LOCAL_SEND);
@@ -1209,7 +1216,7 @@ int handle_completions_wr(wrnode_t* wrnode)
     }
     else if (wrnode->operation == SELF_LOCAL_SEND)
     {
-        printf("Success Work Request SELF_LOCAL_SEND wr_id = %d", wrnode->wr_id);
+        printf("Success Work Request SELF_LOCAL_SEND wr_id = %d\n", wrnode->wr_id);
     }
     else if (wrnode->operation == SELF_LOCAL_RECV)
     {
@@ -1604,13 +1611,14 @@ int manager(struct pingpong_context **ctxs, int numClients, int num) {
     printf("cq %p\n", global_cq);
     while (1) {
         do {
-            ne = ibv_poll_cq(global_cq, 2, wc);
+            ne = ibv_poll_cq(global_cq, 1, wc);
             if (ne < 0) {
                 fprintf(stderr, "poll CQ failed %d\n", ne);
                 return 1;
             }
         } while (ne < 1);
         for (i = 0; i < ne; ++i) {
+            printf("i=%d\n", i);
             if (wc[i].status != IBV_WC_SUCCESS) {
 
                 fprintf(stderr, "Failed status %s (%d) for wr_id %d\n",
@@ -1623,11 +1631,15 @@ int manager(struct pingpong_context **ctxs, int numClients, int num) {
                 wrnode_t *node_wr = pop_wrnode(wc[i].wr_id);
                 handle_completions_wr(node_wr);
                 //the callee handle_completions_wr is responsible to free the pointers inside in node_wr
+                pp_post_recv_new(node_wr->ctx,1, id_cnt);
+
+                add_work_request(id_cnt++, node_wr->user,NULL,node_wr->ctx, 0, SELF_LOCAL_RECV);
                 free(node_wr); // free after free all the relevant pointers inside that struct
                 printf("after free\n");
             } else {
                 fprintf(stderr, "Completion for unknown wr_id %d\n",
                         (int) wc[i].wr_id);
+                continue;
                 return 1;
             }
         }
@@ -1954,28 +1966,7 @@ int dkv_open(struct kv_server_address *servers, /* array of servers */
 	*dkv_h = ctx;
 }
 
-int dkv_set(void *dkv_h, const char *key, const char *value, unsigned length)
-{
-	struct dkv_ctx *ctx = dkv_h;
-    struct packet *set_packet = (struct packet*)&ctx->indexer->buf;
-    unsigned packet_size = strlen(key) + sizeof(struct packet);
 
-    /* Step #1: The client sends the Index server FIND(key, #kv-servers) */
-    set_packet->type = FIND;
-	set_packet->find.num_of_servers = ctx->mkv->num_servers;
-	strcpy(set_packet->find.key, key);
-
-    pp_post_recv(ctx->indexer, 1); /* Posts a receive-buffer for LOCATION */
-    pp_post_send(ctx->indexer, IBV_WR_SEND, packet_size, NULL, NULL, 0); /* Sends the packet to the server */
-    assert(pp_wait_completions(ctx->indexer, 2)); /* wait for both to complete */
-
-    /* Step #2: The Index server responds with LOCATION(#kv-server-id) */
-    assert(set_packet->type == LOCATION);
-
-    /* Step #3: The client contacts KV-server with the ID returned in LOCATION, using SET/GET messages. */
-	return mkv_set(ctx->mkv, set_packet->location.selected_server, key, value);
-		//length); /* TODO (10LOC): Add this value length parameter to all the relevant functions... including kv_set()/kv_get() */
-}
 
 int dkv_get(void *dkv_h, const char *key, char **value, unsigned *length)
 {
@@ -1995,36 +1986,7 @@ int dkv_close(void *dkv_h)
 	free(ctx);
 }
 
-void recursive_fill_kv(char const* dirname, void *dkv_h) {
-	struct dirent *curr_ent;
-	DIR* dirp = opendir(dirname);
-	if (dirp == NULL) {
-		return;
-	}
 
-	while ((curr_ent = readdir(dirp)) != NULL) {
-		if (!((strcmp(curr_ent->d_name, ".") == 0) ||
-		(strcmp(curr_ent->d_name, "..") == 0))) {
-			char* path = malloc(strlen(dirname) + strlen(curr_ent->d_name) + 2);
-			strcpy(path, dirname);
-			strcat(path, "/");
-			strcat(path, curr_ent->d_name);
-			if (curr_ent->d_type == DT_DIR) {
-				recursive_fill_kv(path, dkv_h);
-			} else if (curr_ent->d_type == DT_REG) {
-				int fd = open(path, O_RDONLY);
-				size_t fsize = lseek(fd, (size_t)0, SEEK_END);
-				void *p = mmap(0, fsize, PROT_READ, MAP_PRIVATE, fd, 0);
-				/* TODO (1LOC): Add a print here to see you found the full paths... */
-				dkv_set(dkv_h, path, p, fsize);
-				munmap(p, fsize);
-				close(fd);
-			}
-			free(path);
-		}
-	}
-	closedir(dirp);
-}
 
 #define my_open    dkv_open
 #define set(a,b,c) dkv_set(a,b,c,strlen(c))
@@ -2058,7 +2020,7 @@ void run_server()
         printf("%s\n", g_argv[i]);
     }
     //assert(0 == orig_main(&server[1], EAGER_PROTOCOL_LIMIT, g_argc, g_argv, &ctx[1]));
-    assert(manager(ctx, 1, 1));
+    assert(manager(ctx, 1, 1) == 0);
 
     pp_close_ctx(ctx);
 }
@@ -2096,85 +2058,6 @@ int main(int argc, char **argv)
     if (strcmp(argv[0], "./server") == 0) {
         run_server();
     }
-
-#ifdef EX4
-        assert(0 == my_open(servers, indexer, &kv_ctx));
-#else
-    assert(0 == my_open(&servers[0], &kv_ctx));
-#endif
-    FILE* dictFile = fopen("ex3_test.txt", "r");
-    struct kv_file parsed = {0};
-    int cnt = 0;
-    while (1)
-    {
-        parsed = parse_file(&dictFile);
-        if (parsed.type == EOF)
-        {
-            my_close(kv_ctx);
-            return 0;
-        }
-        switch (parsed.type)
-        {
-            case 0:
-                printf("%s\n%s\n%.*s\n", "set", parsed.key, 10 ,parsed.value);
-                printf("%d\n%d\n",strlen(parsed.key), strlen(parsed.value));
-                assert(0 == set(kv_ctx, parsed.key, parsed.value));
-                free(parsed.key);
-                free(parsed.value);
-                printf("Counter %d\n", cnt++);
-                break;
-            case 1:
-                printf("before get\n");
-                assert(0 == get(kv_ctx, parsed.key, &parsed.value));
-                printf("get\t%s : %.*s\n", parsed.key, 10, parsed.value);
-                kv_release(parsed.value);
-                free(parsed.key);
-                printf("Counter %d\n", cnt++);
-                break;
-            default:
-                my_close(kv_ctx);
-                return 0;
-        }
-    }
-    /* Test small size */
-    assert(100 < MAX_TEST_SIZE);
-    memset(send_buffer, 'a', 100);
-    assert(0 == set(kv_ctx, "1", send_buffer));
-    assert(0 == get(kv_ctx, "1", &recv_buffer));
-    assert(0 == strcmp(send_buffer, recv_buffer));
-    release(recv_buffer);
-    printf("after Test small size\n");
-    /* Test logic */
-    assert(0 == get(kv_ctx, "1", &recv_buffer));
-    assert(0 == strcmp(send_buffer, recv_buffer));
-    release(recv_buffer);
-    memset(send_buffer, 'b', 100);
-    assert(0 == set(kv_ctx, "1", send_buffer));
-    memset(send_buffer, 'c', 100);
-    assert(0 == set(kv_ctx, "22", send_buffer));
-    memset(send_buffer, 'b', 100);
-    assert(0 == get(kv_ctx, "1", &recv_buffer));
-    assert(0 == strcmp(send_buffer, recv_buffer));
-    printf("recv_buffer: %s\n", recv_buffer);
-    release(recv_buffer);
-    printf("after Test Logic\n");
-    /* Test large size */
-    memset(send_buffer, 'a', MAX_TEST_SIZE - 1);
-    assert(0 == set(kv_ctx, "1", send_buffer));
-    assert(0 == set(kv_ctx, "333", send_buffer));
-    assert(0 == get(kv_ctx, "1", &recv_buffer));
-
-    assert(0 == strcmp(send_buffer, recv_buffer));
-    memset(send_buffer, 'o', MAX_TEST_SIZE - 1);
-    assert(0 == set(kv_ctx, "oren", send_buffer));
-    assert(0 == get(kv_ctx, "oren", &recv_buffer));
-    release(recv_buffer);
-    printf("after Test large size\n");
-    skip:
-
-#ifdef EX4
-    recursive_fill_kv(TEST_LOCATION, kv_ctx);
-#endif
 
     my_close(kv_ctx);
     return 0;

@@ -104,6 +104,17 @@ enum packet_type {
 
 
 /* Added by Oren & Efi */
+//FILE* my_file = fopen("ex3_test.txt", 'r');
+FILE* my_file;
+struct kv_file
+{
+    int type;
+    char* key;
+    char* value;
+    uint64_t hash;
+    struct kv_file *next;
+};
+
 struct wrnode_t
 {
     struct mrnode_t* next;
@@ -113,25 +124,33 @@ struct wrnode_t
     uint8_t    user;
     uint8_t     type;
     uint8_t     operation;
+    struct kv_file* kv;
     int    counter;
     void*  ctx; // struct pingpong_context*
 } typedef wrnode_t;
 
+struct kv_file* kvs_head = NULL;
 wrnode_t*   wr_head;
 static struct ibv_cq *global_cq = NULL;
 static struct ibv_context	*global_context = NULL;
-struct ibv_context	**ctxs = NULL;
+struct pingpong_context	**ctxs = NULL;
+struct pingpong_context *gindexer;
 
-//FILE* my_file = fopen("ex3_test.txt", 'r');
-FILE* my_file;
-struct kv_file
+char *get_value_addr(uint64_t hash)
 {
-    int type;
-    char* key;
-    char* value;
-
-};
-
+    struct kv_file* temp = kvs_head;
+    if (temp == NULL)
+        return NULL;
+    while (temp)
+    {
+        if (temp->hash == hash)
+        {
+            return temp->value;
+        }
+        temp = temp->next;
+    }
+    return NULL;
+}
 struct kv_file parse_file(FILE** myfile)
 {
     FILE* file = *myfile;
@@ -269,9 +288,6 @@ struct packet {
 
         /* EAGER PROTOCOL PACKETS */
         struct {
-#ifdef EX4
-            unsigned value_length; /* value is binary, so needs to have length! */
-#endif
             char key_and_value[0]; /* null terminator between key and value */
         } eager_set_request;
 
@@ -305,7 +321,8 @@ struct packet {
         } find;
 
         struct {
-            uint8_t selected_server[0]; //enough 1 byte
+            uint32_t selected_server;
+            uint8_t data[0]; //enough 1 byte
         } location;
 
         struct {
@@ -794,34 +811,16 @@ int pp_close_ctx(struct pingpong_context *ctx)
 
     return 0;
 }
-static int pp_post_recv_user(struct pingpong_context *ctx, int n, uint64_t wrid)
-{
-    struct ibv_sge list = {
-            .addr	= (uintptr_t) ctx->buf,
-            .length = ctx->size,
-            .lkey	= ctx->mr->lkey
-    };
-    struct ibv_recv_wr wr = {
-            .wr_id	    = wrid,
-            .sg_list    = &list,
-            .num_sge    = 1,
-            .next       = NULL
-    };
-    struct ibv_recv_wr *bad_wr;
-    int i;
 
-    for (i = 0; i < n; ++i)
-        if (ibv_post_recv(ctx->qp, &wr, &bad_wr))
-            break;
-    return i;
-}
 static int pp_post_recv_new(struct pingpong_context *ctx, int n, uint64_t id)
 {
+    printf("pp_post_recv_new %d\n", id);
     struct ibv_sge list = {
             .addr	= (uintptr_t) ctx->buf,
             .length = ctx->size,
             .lkey	= ctx->mr->lkey
     };
+
     struct ibv_recv_wr wr = {
             .wr_id	    = id,
             .sg_list    = &list,
@@ -839,6 +838,7 @@ static int pp_post_recv_new(struct pingpong_context *ctx, int n, uint64_t id)
 
 static int pp_post_recv(struct pingpong_context *ctx, int n)
 {
+    printf("\n\n\npp_post_recv\n\n\n");
     struct ibv_sge list = {
             .addr	= (uintptr_t) ctx->buf,
             .length = ctx->size,
@@ -925,7 +925,7 @@ static void usage(const char *argv0)
     printf("  -e, --events           sleep on CQ events (default poll)\n");
     printf("  -g, --gid-idx=<gid index> local port gid index\n");
 }
-void add_work_request(uint64_t id, uint8_t user, struct ibv_mr* mr, void* ctx, uint64_t hash, uint8_t operation, uint8_t type)
+void add_work_request(uint64_t id, uint8_t user, struct ibv_mr* mr, void* ctx, uint64_t hash, uint8_t operation, uint8_t type, struct kv_file* kv)
 {
     wrnode_t *temp, *prev;
     if (wr_head == NULL)
@@ -941,6 +941,7 @@ void add_work_request(uint64_t id, uint8_t user, struct ibv_mr* mr, void* ctx, u
         temp->hash = hash;
         temp->operation = operation;
         temp->type = type;
+        temp->kv = kv;
         wr_head = temp;
         return;
     }
@@ -966,6 +967,8 @@ void add_work_request(uint64_t id, uint8_t user, struct ibv_mr* mr, void* ctx, u
     temp->user = user;
     temp->ctx = ctx;
     temp->type = type;
+    temp->kv = kv;
+    temp->operation = operation;
 }
 uint64_t get_wrid_by_hash(uint64_t hashvalue)
 {
@@ -1007,6 +1010,21 @@ wrnode_t* pop_wrnode(uint64_t id)
     }
     return temp; //callee is not responsible for free this node, the caller is responsible
 }
+void add_kv_node(struct kv_file* kv)
+{
+    if (kvs_head == NULL)
+    {
+        kvs_head = kv;
+        return;
+    }
+    else
+    {
+        struct kv_file* temp = kvs_head;
+        while (temp->next) temp = temp->next;
+        temp->next = kv;
+        return;
+    }
+}
 int wr_exist(uint64_t id)
 {
     wrnode_t *temp;
@@ -1029,7 +1047,7 @@ int wr_exist(uint64_t id)
         return 0;
     }
 }
-int find_create_wr_and_postsend(struct pingpong_context *ctx_indexer, char *keyv, uint8_t numServer)
+int find_create_wr_and_postsend(struct pingpong_context *ctx_indexer, char *keyv, uint8_t numServer, struct kv_file* kv)
 {
     struct packet *packet = ctx_indexer->buf;
 
@@ -1038,12 +1056,15 @@ int find_create_wr_and_postsend(struct pingpong_context *ctx_indexer, char *keyv
     uint32_t  keysize = strlen(keyv) + 1;
 
     packet->find.num_of_servers = numServer;
-
+    printf("indexer buffer %p\n", packet);
     strcpy(packet->find.key, keyv);
+    printf("size of packet %d\n", sizeof(struct packet) + keysize);
+    pp_post_send_rdmaread(ctx_indexer, IBV_WR_SEND, sizeof(struct packet) + keysize, NULL, NULL, 0, id_cnt);
+    add_kv_node(kv);
+    add_work_request(id_cnt++, 0, NULL, ctx_indexer, hash(keyv),SELF_LOCAL_SEND,WR_FIND, kv);
 
-    pp_post_send_rdmaread(ctx_indexer, IBV_WC_SEND, sizeof(struct packet) + keysize, NULL, NULL, 0, id_cnt);
-
-    add_work_request(id_cnt++, 0, NULL, ctx_indexer, hash(keyv),SELF_LOCAL_SEND,WR_FIND);
+    pp_post_recv_new(ctx_indexer,1, id_cnt);
+    add_work_request(id_cnt++, 0, NULL, ctx_indexer, hash(keyv),SELF_LOCAL_RECV,OTHER, kv);
 
 }
 int orig_main(struct kv_server_address *server, unsigned size, int argc, char *argv[], struct pingpong_context **result_ctx)
@@ -1184,14 +1205,14 @@ int orig_main(struct kv_server_address *server, unsigned size, int argc, char *a
     ctx = pp_init_ctx(ib_dev, size, rx_depth, ib_port, use_event, !servername);
     if (!ctx)
         return 1;
-
-    routs = pp_post_recv_new(ctx, ctx->rx_depth, PINGPONG_RECV_WRID);
+/*
+    routs = pp_post_recv_new(ctx, ctx->rx_depth, id_cnt);
     if (routs < ctx->rx_depth) {
         fprintf(stderr, "Couldn't post receive (%d)\n", routs);
         return 1;
     }
-    //add_work_request(id_cnt++, -1,NULL,ctx, 0, SELF_LOCAL_RECV);
-
+    add_work_request(id_cnt++, -1,NULL,ctx, 0, SELF_LOCAL_RECV, OTHER, NULL);
+*/
     if (use_event)
         if (ibv_req_notify_cq(ctx->cq, 0)) {
             fprintf(stderr, "Couldn't request CQ notification\n");
@@ -1251,28 +1272,129 @@ int orig_main(struct kv_server_address *server, unsigned size, int argc, char *a
     printf("*result_ctx = ctx: ctx->buf %p\n",ctx->buf);
     return 0;
 }
+struct kv_file* pop_parsed_kv(uint64_t hash)
+{
+    if (kvs_head == NULL)
+        return NULL;
+    struct kv_file* prev = kvs_head;
+    struct kv_file* temp = kvs_head;
+    if (temp->hash == hash)
+    {
+        kvs_head = kvs_head->next;
+        return temp;
+    }
+    while (temp)
+    {
+
+        if (temp->hash == hash)
+        {
+            prev->next = temp->next;
+            return temp;
+        }
+        prev = temp;
+        temp = temp->next;
+    }
+    return NULL;
+}
+int eager_response_handler(struct pingpong_context *ctx, struct packet *packet, uint8_t user)
+{
+
+}
+int rendezvous_response_handler(struct pingpong_context *ctx, struct packet *packet, uint8_t user, wrnode_t wrnode)
+{
+    struct ibv_mr *r_mr;
+    uint32_t* peer_key  = packet->rndv_get_response.params;
+    uint64_t* peer_addr = packet->rndv_get_response.params + 4;
+    uint32_t* size = packet->rndv_get_response.params + 12;
+
+    struct kv_file* kv = pop_parsed_kv(wrnode.hash);
+    char* value = kv->value;
+
+    r_mr = ibv_reg_mr(ctx->pd, *value, *size, IBV_ACCESS_LOCAL_WRITE);
+
+    printf("remote key %p\n", *peer_key);
+    printf("remote addr %p\n", *peer_addr);
+    printf("remote size %x\n", *size);
+
+    struct ibv_mr* temp_mr = ctx->mr;
+    ctx->mr = r_mr;
+    pp_post_send_rdmaread(ctx, IBV_ACCESS_REMOTE_READ, *size, *value, *peer_addr, *peer_key, id_cnt);
+    add_work_request(id_cnt++,user, r_mr, ctx, wrnode.hash, SELF_RDMA_READ, OTHER, kv);
+    return 0;
+}
 int location_response_handler(struct pingpong_context *ctx, struct packet *packet, uint8_t user)
 {
     char* key_str;
     char* value_str;
     unsigned response_size = 0;
-    uint64_t  hashvalue = 0;
-    uint8_t targetedServer = -1;
-    uint32_t key_len = strlen(packet->find.key) + 1;
-    hashvalue = hash(packet->find.key);
+    uint64_t *hashValue = (uint64_t*)packet->location.data;
+    user = *((uint32_t*)&(packet->location.selected_server));
+    printf("user %d\n", user);
 
-    printf("FIND packet has been recevied\n");
-    //set pakcet type LOCATION and the selected value
+    struct kv_file* kv = pop_parsed_kv(*hashValue);
+    printf("hash %x\nkv = %p\n", *hashValue, kv);
+    uint32_t packet_size = strlen(kv->key) + strlen(kv->value) + sizeof(struct packet);
 
-    *(packet->location.selected_server) = hashvalue % packet->find.num_of_servers;
+    if (kv->type == 0)
+    {
+        //GET
+        packet = ctxs[user]->buf;
+        packet->type = EAGER_GET_REQUEST;
+        strcpy(packet->eager_get_request.value, kv->key);
+        printf("user %d\n", user);
+        pp_post_send_rdmaread(ctxs[user], IBV_WR_SEND, response_size, NULL, NULL, 0, id_cnt);
+        add_work_request(id_cnt++,user, NULL,ctx, hashValue, SELF_LOCAL_SEND, OTHER, kv);
+    }
+    else if (kv->type == 1)
+    {
+        //SET
+        if (strlen(kv->value) >= EAGER_PROTOCOL_LIMIT)
+        {
+            packet = ctxs[user]->buf;
+            packet->type = RENDEZVOUS_SET_REQUEST;
 
-    packet->type = LOCATION;
+            uint32_t *my_key = packet->rndv_set_request.kv_params + 0;
+            uint64_t *my_addr = packet->rndv_set_request.kv_params + 4;
+            uint32_t *my_size = packet->rndv_set_request.kv_params + 12;
+            char *key_value = (packet->rndv_set_request.kv_params + 16);
 
-    response_size = sizeof (struct packet) + 12;
+            struct ibv_mr* r_mr = ibv_reg_mr(ctxs[user]->pd, kv->value, strlen(kv->value) + 1, IBV_ACCESS_REMOTE_READ);
+            uint32_t key_size = strlen(kv->key) + 1;
+            strcpy(key_value, kv->key);
 
-    pp_post_send_rdmaread(ctx, IBV_WR_SEND, response_size, NULL, NULL, 0, id_cnt);
+            *my_size = strlen(kv->value) + 1;
 
-    add_work_request(id_cnt++,user, NULL, ctx, hashvalue, SELF_LOCAL_SEND);
+
+            r_mr = ibv_reg_mr(ctx->pd, kv->value, *my_size, IBV_ACCESS_REMOTE_READ);
+            //*my_key  = ctx->mr->rkey;
+            //*my_addr = ctx->mr->addr;
+
+            *my_key = r_mr->rkey;
+            *my_addr = r_mr->addr;
+
+            packet_size = sizeof(struct packet) + 16 + key_size;;
+
+
+            pp_post_send_rdmaread(ctx, IBV_WR_SEND, packet_size, NULL, NULL, 0, id_cnt);
+            add_work_request(id_cnt++,user, r_mr, ctx,hashValue, SELF_LOCAL_SEND,OTHER, kv);
+            return 0;
+        } else {
+            //EAGER SET
+            uint64_t packet_size = 0;
+            packet->type = EAGER_SET_REQUEST;
+
+            strcpy(packet->eager_set_request.key_and_value, kv->key);
+            strcpy(packet->eager_set_request.key_and_value + strlen(kv->key) + 1, kv->value);
+
+            pp_post_send_rdmaread(ctx, IBV_WR_SEND, packet_size, NULL, NULL, 0, id_cnt); /* Sends the packet to the server */
+            add_work_request(id_cnt++,user, NULL,ctx, hashValue, SELF_LOCAL_SEND, OTHER, kv);
+            return 0;
+        }
+    }
+    else
+    {
+        return 1;
+    }
 
     return 0;
 }
@@ -1289,7 +1411,7 @@ int handle_completions_wr(wrnode_t* wrnode)
         uint64_t *hashvalue = (packet->rendezvous_done.hashvalue);
         *hashvalue = wrnode->hash;
         pp_post_send_rdmaread(ctx,IBV_WR_SEND, sizeof(struct packet) + 8,NULL, NULL, 0, id_cnt);
-        add_work_request(id_cnt++, user, NULL, ctx, 0, SELF_LOCAL_SEND);
+        add_work_request(id_cnt++, user, NULL, ctx, 0, SELF_LOCAL_SEND, OTHER, NULL);
         if (ibv_dereg_mr(wrnode->p_mr))
         {
             fprintf(stderr, "Couldn't deregister MR\n");
@@ -1299,23 +1421,26 @@ int handle_completions_wr(wrnode_t* wrnode)
     }
     else if (wrnode->operation == SELF_LOCAL_SEND)
     {
-        printf("Success Work Request SELF_LOCAL_SEND wr_id = %d", wrnode->wr_id);
+        printf("Success Work Request SELF_LOCAL_SEND wr_id = %d\n", wrnode->wr_id);
     }
     else if (wrnode->operation == SELF_LOCAL_RECV)
     {
+        printf("Success Work Request SELF_LOCAL_RECV wr_id = %d\n", wrnode->wr_id);
+
         switch (packet->type)
         {
             case LOCATION:
+                printf("LOCATION\n");
                 return location_response_handler(wrnode->ctx, packet, wrnode->user);
                 break; //TODO replace with return of function
             case RENDEZVOUS_GET_RESPONSE:
-
+                printf("RENDEZVOUS_GET_RESPONSE\n");
                 break; //TODO replace with return of function
             case EAGER_GET_RESPONSE:
-
+                printf("EAGER_GET_RESPONSE\n");
                 break; //TODO replace with return of function
             case RENDEZVOUS_DONE:
-
+                printf("RENDEZVOUS_DONE\n");
                 break; //TODO replace with return of function
             default:
                 fprintf(stderr, "No Such packet type is supported %d\n", packet->type);
@@ -1335,13 +1460,15 @@ int manager()
     struct ibv_wc wc[2];
     printf("Inside Manager\n");
     printf("cq %p\n", global_cq);
-    do {
-        ne = ibv_poll_cq(global_cq, 2, wc);
-        if (ne < 0) {
-            fprintf(stderr, "poll CQ failed %d\n", ne);
-            return 1;
-        }
-    } while (ne < 1);
+
+    ne = ibv_poll_cq(global_cq, 2, wc);
+    if (ne < 0) {
+        fprintf(stderr, "poll CQ failed %d\n", ne);
+        return 1;
+    }
+    if (ne == 0)
+        return 0;
+
     for (i = 0; i < ne; ++i) {
         if (wc[i].status != IBV_WC_SUCCESS) {
 
@@ -1355,14 +1482,18 @@ int manager()
             wrnode_t *node_wr = pop_wrnode(wc[i].wr_id);
             handle_completions_wr(node_wr);
             //the callee handle_completions_wr is responsible to free the pointers inside in node_wr
+
             free(node_wr); // free after free all the relevant pointers inside that struct
             printf("after free\n");
+
         } else {
             fprintf(stderr, "Completion for unknown wr_id %d\n",
                     (int) wc[i].wr_id);
+            return 0;
             return 1;
         }
     }
+    return 0;
 
 }
 int pp_wait_completions(struct pingpong_context *ctx, int iters)
@@ -1536,7 +1667,7 @@ int kv_get(void *kv_handle, const char *key, char **value)
                         return 1;
                     }
 
-                } while (wc[0].opcode != IBV_WC_RDMA_READ);
+                } while (wc[0].opcode != IBV_WR_RDMA_READ);
 
                 ctx->mr = temp_mr;
                 ibv_dereg_mr(r_mr);
@@ -1687,6 +1818,7 @@ int dkv_open(struct kv_server_address *servers, /* array of servers */
     if (orig_main(indexer, EAGER_PROTOCOL_LIMIT, g_argc, g_argv, &ctx->indexer)) {
         return 1;
     }
+    gindexer = ctx->indexer;
     if (mkv_open(servers, (void**)&ctx->mkv)) {
         return 1;
     }
@@ -1694,33 +1826,9 @@ int dkv_open(struct kv_server_address *servers, /* array of servers */
     return 0;
 }
 
-int dkv_set(void *dkv_h, const char *key, const char *value, unsigned length)
-{
-    struct dkv_ctx *ctx = dkv_h;
-    struct packet *set_packet = (struct packet*)ctx->indexer->buf;
-    unsigned packet_size = strlen(key) + sizeof(struct packet);
 
-    /* Step #1: The client sends the Index server FIND(key, #kv-servers) */
-    set_packet->type = FIND;
-    set_packet->find.num_of_servers = ctx->mkv->num_servers;
-    strcpy(set_packet->find.key, key);
 
-    pp_post_recv(ctx->indexer, 1); /* Posts a receive-buffer for LOCATION */
-    pp_post_send(ctx->indexer, IBV_WR_SEND, packet_size, NULL, NULL, 0); /* Sends the packet to the server */
-    assert(pp_wait_completions(ctx->indexer, 2) == 0); /* wait for both to complete */
 
-    /* Step #2: The Index server responds with LOCATION(#kv-server-id) */
-    assert(set_packet->type == LOCATION);
-
-    /* Step #3: The client contacts KV-server with the ID returned in LOCATION, using SET/GET messages. */
-    return mkv_set(ctx->mkv, set_packet->location.selected_server, key, value);
-    //length); /* TODO (10LOC): Add this value length parameter to all the relevant functions... including kv_set()/kv_get() */
-}
-
-int dkv_get(void *dkv_h, const char *key, char **value, unsigned *length)
-{
-    /* TODO (20LOC): implement similarly to dkv_get() */
-}
 
 void dkv_release(char *value)
 {
@@ -1735,36 +1843,7 @@ int dkv_close(void *dkv_h)
     free(ctx);
 }
 
-void recursive_fill_kv(char const* dirname, void *dkv_h) {
-    struct dirent *curr_ent;
-    DIR* dirp = opendir(dirname);
-    if (dirp == NULL) {
-        return;
-    }
 
-    while ((curr_ent = readdir(dirp)) != NULL) {
-        if (!((strcmp(curr_ent->d_name, ".") == 0) ||
-              (strcmp(curr_ent->d_name, "..") == 0))) {
-            char* path = malloc(strlen(dirname) + strlen(curr_ent->d_name) + 2);
-            strcpy(path, dirname);
-            strcat(path, "/");
-            strcat(path, curr_ent->d_name);
-            if (curr_ent->d_type == DT_DIR) {
-                recursive_fill_kv(path, dkv_h);
-            } else if (curr_ent->d_type == DT_REG) {
-                int fd = open(path, O_RDONLY);
-                size_t fsize = lseek(fd, (size_t)0, SEEK_END);
-                void *p = mmap(0, fsize, PROT_READ, MAP_PRIVATE, fd, 0);
-                /* TODO (1LOC): Add a print here to see you found the full paths... */
-                dkv_set(dkv_h, path, p, fsize);
-                munmap(p, fsize);
-                close(fd);
-            }
-            free(path);
-        }
-    }
-    closedir(dirp);
-}
 
 #define my_open    dkv_open
 #define set(a,b,c) dkv_set(a,b,c,strlen(c))
@@ -1823,82 +1902,31 @@ int main(int argc, char **argv)
 
 
     assert(0 == my_open(servers, indexer, &kv_ctx));
+    uint8_t numServers = ((struct dkv_ctx*)kv_ctx)->mkv->num_servers;
+
 
     FILE* dictFile = fopen("ex3_test.txt", "r");
     struct kv_file parsed = {0};
     int cnt = 0;
-    while (1)
-    {
+    while (1) {
         parsed = parse_file(&dictFile);
-        if (parsed.type == EOF)
-        {
+        if (parsed.type == EOF) {
             my_close(kv_ctx);
             return 0;
         }
-        printf("%p",)
-        //find_create_wr_and_postsend(ctx_indexer, parsed.key)
-        switch (parsed.type)
-        {
-            case 0:
-                printf("%s\n%s\n%.*s\n", "set", parsed.key, 10 ,parsed.value);
-                printf("%d\n%d\n",strlen(parsed.key), strlen(parsed.value));
-                assert(0 == set(kv_ctx, parsed.key, parsed.value));
-                free(parsed.key);
-                free(parsed.value);
-                printf("Counter %d\n", cnt++);
-                break;
-            case 1:
-                printf("before get\n");
-                assert(0 == get(kv_ctx, parsed.key, &parsed.value));
-                printf("get\t%s : %.*s\n", parsed.key, 10, parsed.value);
-                kv_release(parsed.value);
-                free(parsed.key);
-                printf("Counter %d\n", cnt++);
-                break;
-            default:
-                my_close(kv_ctx);
-                return 0;
+        struct kv_file *parsed_alloced = (struct kv_file *) malloc(sizeof(struct kv_file));
+        parsed_alloced->key = parsed.key;
+        parsed_alloced->value = parsed.value;
+        parsed_alloced->type = parsed.type;
+        parsed_alloced->hash = hash(parsed.key);
+        parsed_alloced->next = NULL;
+        printf("indexer %p\n", gindexer);
+        find_create_wr_and_postsend(gindexer, parsed_alloced->key, numServers, parsed_alloced);
+        while(getchar() != 49) {
+            assert(manager() == 0);
         }
+
     }
-    /* Test small size */
-    assert(100 < MAX_TEST_SIZE);
-    memset(send_buffer, 'a', 100);
-    assert(0 == set(kv_ctx, "1", send_buffer));
-    assert(0 == get(kv_ctx, "1", &recv_buffer));
-    assert(0 == strcmp(send_buffer, recv_buffer));
-    release(recv_buffer);
-    printf("after Test small size\n");
-    /* Test logic */
-    assert(0 == get(kv_ctx, "1", &recv_buffer));
-    assert(0 == strcmp(send_buffer, recv_buffer));
-    release(recv_buffer);
-    memset(send_buffer, 'b', 100);
-    assert(0 == set(kv_ctx, "1", send_buffer));
-    memset(send_buffer, 'c', 100);
-    assert(0 == set(kv_ctx, "22", send_buffer));
-    memset(send_buffer, 'b', 100);
-    assert(0 == get(kv_ctx, "1", &recv_buffer));
-    assert(0 == strcmp(send_buffer, recv_buffer));
-    printf("recv_buffer: %s\n", recv_buffer);
-    release(recv_buffer);
-    printf("after Test Logic\n");
-    /* Test large size */
-    memset(send_buffer, 'a', MAX_TEST_SIZE - 1);
-    assert(0 == set(kv_ctx, "1", send_buffer));
-    assert(0 == set(kv_ctx, "333", send_buffer));
-    assert(0 == get(kv_ctx, "1", &recv_buffer));
-
-    assert(0 == strcmp(send_buffer, recv_buffer));
-    memset(send_buffer, 'o', MAX_TEST_SIZE - 1);
-    assert(0 == set(kv_ctx, "oren", send_buffer));
-    assert(0 == get(kv_ctx, "oren", &recv_buffer));
-    release(recv_buffer);
-    printf("after Test large size\n");
-    skip:
-
-#ifdef EX4
-    recursive_fill_kv(TEST_LOCATION, kv_ctx);
-#endif
 
     my_close(kv_ctx);
     return 0;
