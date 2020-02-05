@@ -1044,7 +1044,7 @@ int find_create_wr_and_postsend(struct pingpong_context *ctx_indexer, char *keyv
     pp_post_send_rdmaread(ctx_indexer, IBV_WC_SEND, sizeof(struct packet) + keysize, NULL, NULL, 0, id_cnt);
 
     add_work_request(id_cnt++, 0, NULL, ctx_indexer, hash(keyv),SELF_LOCAL_SEND,WR_FIND);
-    
+
 }
 int orig_main(struct kv_server_address *server, unsigned size, int argc, char *argv[], struct pingpong_context **result_ctx)
 {
@@ -1251,7 +1251,120 @@ int orig_main(struct kv_server_address *server, unsigned size, int argc, char *a
     printf("*result_ctx = ctx: ctx->buf %p\n",ctx->buf);
     return 0;
 }
+int location_response_handler(struct pingpong_context *ctx, struct packet *packet, uint8_t user)
+{
+    char* key_str;
+    char* value_str;
+    unsigned response_size = 0;
+    uint64_t  hashvalue = 0;
+    uint8_t targetedServer = -1;
+    uint32_t key_len = strlen(packet->find.key) + 1;
+    hashvalue = hash(packet->find.key);
 
+    printf("FIND packet has been recevied\n");
+    //set pakcet type LOCATION and the selected value
+
+    *(packet->location.selected_server) = hashvalue % packet->find.num_of_servers;
+
+    packet->type = LOCATION;
+
+    response_size = sizeof (struct packet) + 12;
+
+    pp_post_send_rdmaread(ctx, IBV_WR_SEND, response_size, NULL, NULL, 0, id_cnt);
+
+    add_work_request(id_cnt++,user, NULL, ctx, hashvalue, SELF_LOCAL_SEND);
+
+    return 0;
+}
+int handle_completions_wr(wrnode_t* wrnode)
+{
+    struct pingpong_context *ctx = (struct pingpong_context *)wrnode->ctx;
+    struct packet *packet = (struct packet*)ctx->buf;
+    uint8_t user = wrnode->user;
+
+    if (wrnode->operation == SELF_RDMA_READ)
+    {
+        // this host had end REMOTE_READ from the other host send RENDEZVOUS_DONE packet
+        packet->type = RENDEZVOUS_DONE;
+        uint64_t *hashvalue = (packet->rendezvous_done.hashvalue);
+        *hashvalue = wrnode->hash;
+        pp_post_send_rdmaread(ctx,IBV_WR_SEND, sizeof(struct packet) + 8,NULL, NULL, 0, id_cnt);
+        add_work_request(id_cnt++, user, NULL, ctx, 0, SELF_LOCAL_SEND);
+        if (ibv_dereg_mr(wrnode->p_mr))
+        {
+            fprintf(stderr, "Couldn't deregister MR\n");
+            return 1;
+        }
+        wrnode->p_mr = NULL;
+    }
+    else if (wrnode->operation == SELF_LOCAL_SEND)
+    {
+        printf("Success Work Request SELF_LOCAL_SEND wr_id = %d", wrnode->wr_id);
+    }
+    else if (wrnode->operation == SELF_LOCAL_RECV)
+    {
+        switch (packet->type)
+        {
+            case LOCATION:
+                return location_response_handler(wrnode->ctx, packet, wrnode->user);
+                break; //TODO replace with return of function
+            case RENDEZVOUS_GET_RESPONSE:
+
+                break; //TODO replace with return of function
+            case EAGER_GET_RESPONSE:
+
+                break; //TODO replace with return of function
+            case RENDEZVOUS_DONE:
+
+                break; //TODO replace with return of function
+            default:
+                fprintf(stderr, "No Such packet type is supported %d\n", packet->type);
+                return 1;
+        }
+    }
+    else
+    {
+        fprintf(stderr, "No Such Operation %d\n", wrnode->operation);
+        return 1;
+    }
+}
+int manager()
+{
+    unsigned i, ne;
+    struct pingpong_context *ctx;
+    struct ibv_wc wc[2];
+    printf("Inside Manager\n");
+    printf("cq %p\n", global_cq);
+    do {
+        ne = ibv_poll_cq(global_cq, 2, wc);
+        if (ne < 0) {
+            fprintf(stderr, "poll CQ failed %d\n", ne);
+            return 1;
+        }
+    } while (ne < 1);
+    for (i = 0; i < ne; ++i) {
+        if (wc[i].status != IBV_WC_SUCCESS) {
+
+            fprintf(stderr, "Failed status %s (%d) for wr_id %d\n",
+                    ibv_wc_status_str(wc[i].status),
+                    wc[i].status, (int) wc[i].wr_id);
+            return 1;
+        }
+        if (wr_exist(wc[i].wr_id)) {
+            printf("take care of %d\n", wc[i].wr_id);
+            wrnode_t *node_wr = pop_wrnode(wc[i].wr_id);
+            handle_completions_wr(node_wr);
+            //the callee handle_completions_wr is responsible to free the pointers inside in node_wr
+            free(node_wr); // free after free all the relevant pointers inside that struct
+            printf("after free\n");
+        } else {
+            fprintf(stderr, "Completion for unknown wr_id %d\n",
+                    (int) wc[i].wr_id);
+            return 1;
+        }
+    }
+
+}
 int pp_wait_completions(struct pingpong_context *ctx, int iters)
 {
     int rcnt, scnt, num_cq_events, use_event = 0;
