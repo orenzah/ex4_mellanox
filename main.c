@@ -290,8 +290,8 @@ struct packet {
 
 #ifdef EX4
         struct {
-            unsigned num_of_servers;
-            char key[0];
+            uint8_t num_of_servers;
+            uint8_t key[0];
         } find;
 
         struct {
@@ -782,27 +782,7 @@ int pp_close_ctx(struct pingpong_context *ctx)
 
     return 0;
 }
-static int pp_post_recv_user(struct pingpong_context *ctx, int n, uint64_t wrid)
-{
-    struct ibv_sge list = {
-            .addr	= (uintptr_t) ctx->buf,
-            .length = ctx->size,
-            .lkey	= ctx->mr->lkey
-    };
-    struct ibv_recv_wr wr = {
-            .wr_id	    = wrid,
-            .sg_list    = &list,
-            .num_sge    = 1,
-            .next       = NULL
-    };
-    struct ibv_recv_wr *bad_wr;
-    int i;
 
-    for (i = 0; i < n; ++i)
-        if (ibv_post_recv(ctx->qp, &wr, &bad_wr))
-            break;
-    return i;
-}
 static int pp_post_recv_new(struct pingpong_context *ctx, int n, uint64_t id)
 {
     struct ibv_sge list = {
@@ -1129,13 +1109,19 @@ int find_request_handler(struct pingpong_context *ctx, struct packet *packet, ui
     uint32_t key_len = strlen(packet->find.key) + 1;
     hashvalue = hash(packet->find.key);
 
-
+    printf("FIND packet has been recevied\n");
     //set pakcet type LOCATION and the selected value
+
     *(packet->location.selected_server) = hashvalue % packet->find.num_of_servers;
+
     packet->type = LOCATION;
+
     response_size = sizeof (struct packet) + 12;
+
     pp_post_send_rdmaread(ctx, IBV_WR_SEND, response_size, NULL, NULL, 0, id_cnt);
+
     add_work_request(id_cnt++,user, NULL, ctx, hashvalue, SELF_LOCAL_SEND);
+
     return 0;
 }
 int get_request_handler(struct pingpong_context *ctx, struct packet *packet, uint8_t user)
@@ -1223,7 +1209,7 @@ int handle_completions_wr(wrnode_t* wrnode)
     }
     else if (wrnode->operation == SELF_LOCAL_SEND)
     {
-        printf("Success Work Request wr_id = %d", wrnode->wr_id);
+        printf("Success Work Request SELF_LOCAL_SEND wr_id = %d", wrnode->wr_id);
     }
     else if (wrnode->operation == SELF_LOCAL_RECV)
     {
@@ -1543,7 +1529,7 @@ int orig_main(struct kv_server_address *server, unsigned size, int argc, char *a
     ctx = pp_init_ctx(ib_dev, size, rx_depth, ib_port, use_event, !servername);
     if (!ctx)
         return 1;
-
+    printf("ctx->rx_depth %d\n",ctx->rx_depth);
     routs = pp_post_recv_new(ctx, ctx->rx_depth, id_cnt);
     if (routs < ctx->rx_depth) {
         fprintf(stderr, "Couldn't post receive (%d)\n", routs);
@@ -1614,31 +1600,36 @@ int manager(struct pingpong_context **ctxs, int numClients, int num) {
     unsigned i, ne;
     struct pingpong_context *ctx;
     struct ibv_wc wc[2];
-    do {
-        ne = ibv_poll_cq(global_cq, 2, wc);
-        if (ne < 0) {
-            fprintf(stderr, "poll CQ failed %d\n", ne);
-            return 1;
-        }
-    } while (ne < 1);
-    for (i = 0; i < ne; ++i) {
-        if (wc[i].status != IBV_WC_SUCCESS) {
+    printf("Inside Manager\n");
+    printf("cq %p\n", global_cq);
+    while (1) {
+        do {
+            ne = ibv_poll_cq(global_cq, 2, wc);
+            if (ne < 0) {
+                fprintf(stderr, "poll CQ failed %d\n", ne);
+                return 1;
+            }
+        } while (ne < 1);
+        for (i = 0; i < ne; ++i) {
+            if (wc[i].status != IBV_WC_SUCCESS) {
 
-            fprintf(stderr, "Failed status %s (%d) for wr_id %d\n",
-                    ibv_wc_status_str(wc[i].status),
-                    wc[i].status, (int) wc[i].wr_id);
-            return 1;
-        }
-        if (wr_exist(wc[i].wr_id))
-        {
-            wrnode_t *node_wr = pop_wrnode(wc[i].wr_id);
-            handle_completions_wr(node_wr);
-            //the callee handle_completions_wr is responsible to free the pointers inside in node_wr
-            free(node_wr); // free after free all the relevant pointers inside that struct
-        } else {
-            fprintf(stderr, "Completion for unknown wr_id %d\n",
-                    (int) wc[i].wr_id);
-            return 1;
+                fprintf(stderr, "Failed status %s (%d) for wr_id %d\n",
+                        ibv_wc_status_str(wc[i].status),
+                        wc[i].status, (int) wc[i].wr_id);
+                return 1;
+            }
+            if (wr_exist(wc[i].wr_id)) {
+                printf("take care of %d\n", wc[i].wr_id);
+                wrnode_t *node_wr = pop_wrnode(wc[i].wr_id);
+                handle_completions_wr(node_wr);
+                //the callee handle_completions_wr is responsible to free the pointers inside in node_wr
+                free(node_wr); // free after free all the relevant pointers inside that struct
+                printf("after free\n");
+            } else {
+                fprintf(stderr, "Completion for unknown wr_id %d\n",
+                        (int) wc[i].wr_id);
+                return 1;
+            }
         }
     }
 }
@@ -2052,7 +2043,7 @@ void recursive_fill_kv(char const* dirname, void *dkv_h) {
 
 void run_server()
 {
-    struct pingpong_context *ctx[2];
+    struct pingpong_context *ctx[1];
     struct kv_server_address server[2] = {0};
     wr_head = NULL;
 
@@ -2066,8 +2057,8 @@ void run_server()
     {
         printf("%s\n", g_argv[i]);
     }
-    assert(0 == orig_main(&server[1], EAGER_PROTOCOL_LIMIT, g_argc, g_argv, &ctx[1]));
-    assert(manager(ctx, 2, 1));
+    //assert(0 == orig_main(&server[1], EAGER_PROTOCOL_LIMIT, g_argc, g_argv, &ctx[1]));
+    assert(manager(ctx, 1, 1));
 
     pp_close_ctx(ctx);
 }
